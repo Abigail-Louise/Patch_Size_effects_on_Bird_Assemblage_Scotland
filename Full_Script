@@ -1,0 +1,1207 @@
+# Dissertation Script 
+# "The effect of forest patch size on bird assemblage structure and composition
+# in the temperate deciduous woodlands of Scotland.
+# A passive acoustic monitoring approach." 
+
+# Author: Abigail Haining, University of Edinburgh
+# March 2026
+
+# Load Libraries
+library(occupancyTuts)
+library(terra)
+library(unmarked)
+library(janitor)
+library(betareg)
+library(MASS)
+library(vegan)
+library(indicspecies)
+library(viridis)
+library(viridisLite)
+library(ggtext)
+library(tidyverse)
+library(DHARMa)
+library(AICcmodavg)
+library(car)
+library(glmmTMB)
+
+# Set Seed
+set.seed(100)
+
+### 1. WEATHER DATA PROCESSING ----
+
+# Load ERA5 data
+# Instant data includes wind (u & v) and temp data
+era_inst <- rast("your_path")
+# Accumulative data includes rainfall data
+era_acc  <- rast("your_path")
+
+# Site coordinates
+sites <- data.frame(
+  lat = c(
+    56.155196,56.064907,56.041572,56.061413,56.066086,
+    55.934878,55.908225,55.887171,55.996752,55.962135,
+    56.003955,56.020566,56.043662,56.136994,55.910760,
+    56.140979,56.326588,56.321599,56.269253,56.139103),
+  lon = c(
+    -3.592279,-3.547279,-3.447078,-3.348713,-3.290733,
+    -3.008563,-2.980734,-2.826877,-2.787386,-2.845098,
+    -3.583008,-3.768519,-3.898148,-3.914772,-3.654204,
+    -3.797309,-3.743630,-3.570111,-3.403390,-3.241825))
+
+sites_vect <- vect(sites, geom=c("lon","lat"), crs="EPSG:4326")
+
+# Extract ERA5 values
+weather_inst <- terra::extract(era_inst, sites_vect)[,-1]
+weather_acc  <- terra::extract(era_acc, sites_vect)[,-1]
+
+
+# Temperature
+temp <- weather_inst[, grep("t2m", names(weather_inst))] - 273.15
+
+temp_long <- as.data.frame(temp) %>%
+  mutate(site = 1:20) %>%
+  pivot_longer(-site, names_to="time", values_to="temp")
+
+temp_long$date <- as.Date(as.POSIXct(
+  as.numeric(sub(".*=", "", temp_long$time)),
+  origin="1970-01-01", tz="UTC"))
+
+temp_daily <- temp_long %>%
+  group_by(site, date) %>%
+  summarise(temp = mean(temp, na.rm=TRUE), .groups="drop")
+
+
+# Wind speed
+
+u <- as.matrix(weather_inst[, grep("u10", names(weather_inst))])
+v <- as.matrix(weather_inst[, grep("v10", names(weather_inst))])
+
+wind <- sqrt(u^2 + v^2)
+
+wind_long <- as.data.frame(wind) %>%
+  mutate(site = 1:20) %>%
+  pivot_longer(-site, names_to="time", values_to="wind")
+
+wind_long$date <- as.Date(as.POSIXct(
+  as.numeric(sub(".*=", "", wind_long$time)),
+  origin="1970-01-01", tz="UTC"))
+
+wind_daily <- wind_long %>%
+  group_by(site, date) %>%
+  summarise(wind = mean(wind, na.rm=TRUE), .groups="drop")
+
+
+# Rainfall
+
+rain <- weather_acc[, grep("tp", names(weather_acc))] * 1000
+
+rain_long <- as.data.frame(rain) %>%
+  mutate(site = 1:20) %>%
+  pivot_longer(-site, names_to="time", values_to="rain")
+
+rain_long$date <- as.Date(as.POSIXct(
+  as.numeric(sub(".*=", "", rain_long$time)),
+  origin="1970-01-01", tz="UTC"))
+
+rain_daily <- rain_long %>%
+  group_by(site, date) %>%
+  summarise(rain = sum(rain, na.rm=TRUE), .groups="drop")
+
+
+# Survey dates
+
+survey_dates <- data.frame(
+  site = 1:20,
+  start = as.Date(c(
+    rep("2025-07-05",5),
+    rep("2025-07-10",5),
+    rep("2025-07-11",5),
+    rep("2025-07-09",5))))
+
+survey_dates$day1 <- survey_dates$start
+survey_dates$day2 <- survey_dates$start + 1
+survey_dates$day3 <- survey_dates$start + 2
+
+survey_long <- survey_dates %>%
+  pivot_longer(starts_with("day"),
+               names_to="survey",
+               values_to="date")
+
+survey_long$survey <- as.numeric(gsub("day","",survey_long$survey))
+
+
+# Final dataset
+
+site_weather <- survey_long %>%
+  left_join(temp_daily, by=c("site","date")) %>%
+  left_join(wind_daily, by=c("site","date")) %>%
+  left_join(rain_daily, by=c("site","date"))
+
+
+### 2. LOAD AND WRANGLE DETECTION DATA ----
+
+site_covs <- read_csv("your_path")
+detections <- read_csv("your_path")
+
+# Clean names
+detections <- detections %>% clean_names()
+
+# Ensure the first two columns are correct
+colnames(detections)[1:2] <- c("common_name", "scientific_name")
+
+detections <- detections %>%
+  filter(scientific_name != "Scientific Name")
+
+det_long <- detections %>%
+  pivot_longer(
+    cols = -c(common_name, scientific_name),
+    names_to = "site_survey",
+    values_to = "detected")
+
+det_long <- det_long %>%
+  mutate(
+    site = as.numeric(str_extract(site_survey, "(?<=site_)\\d+")),
+    detected = as.numeric(detected))
+
+
+det_long <- det_long %>%
+  group_by(scientific_name, site) %>%
+  arrange(site, site_survey) %>%
+  mutate(survey = row_number()) %>%
+  ungroup()
+
+det_long <- det_long %>%
+  group_by(scientific_name, site, survey) %>%
+  summarise(detected = max(detected, na.rm = TRUE), .groups = "drop")
+
+# Using dplyr::select explicitly
+det_long %>% dplyr::select(scientific_name, site, survey, detected) %>% dplyr::slice_head(n = 10)
+
+
+### 3. SITE COVARIATES ----
+
+site_covs <- site_covs %>%
+  clean_names()
+
+site_covs <- site_covs %>%
+  dplyr::select(
+    site,
+    size_m_2,
+    elevation_m,
+    distance_to_nearest_patch_m,
+    forest_cover_percent_in_1km_buffer_exc_target_patch) %>%
+  dplyr::arrange(site)
+
+site_covs$log_patch_size <- log(site_covs$size_m_2)
+
+site_covs_scaled <- site_covs %>%
+  dplyr::select(
+    log_patch_size,
+    elevation_m,
+    distance_to_nearest_patch_m,
+    forest_cover_percent_in_1km_buffer_exc_target_patch) %>%
+  mutate(across(everything(), scale))
+
+
+### 4. DETECTION COVARIATES ----
+
+temp_mat <- site_weather %>%
+  dplyr::select(site, survey, temp) %>%
+  tidyr::pivot_wider(names_from = survey, values_from = temp) %>%
+  dplyr::arrange(site) %>%
+  dplyr::select(-site) %>%
+  as.matrix()
+
+wind_mat <- site_weather %>%
+  dplyr::select(site, survey, wind) %>%
+  tidyr::pivot_wider(names_from = survey, values_from = wind) %>%
+  dplyr::arrange(site) %>%
+  dplyr::select(-site) %>%
+  as.matrix()
+
+rain_mat <- site_weather %>%
+  dplyr::select(site, survey, rain) %>%
+  tidyr::pivot_wider(names_from = survey, values_from = rain) %>%
+  dplyr::arrange(site) %>%
+  dplyr::select(-site) %>%
+  as.matrix()
+
+
+### 5. SINGLE_SEASON OCCUPANCY MODELS ----
+
+species_list <- unique(det_long$scientific_name)
+
+results <- list()
+
+for(sp in species_list){
+  
+  sp_data <- det_long %>%
+    dplyr::filter(scientific_name == sp)
+  
+  y <- sp_data %>%
+    dplyr::select(site, survey, detected) %>%
+    tidyr::pivot_wider(names_from = survey, values_from = detected) %>%
+    dplyr::arrange(site) %>%
+    dplyr::select(-site) %>%
+    as.matrix()
+  
+  dim(y)
+  # Should be 20 x 3
+  
+  # Detection covariates
+  obsCovs <- list(
+    temp = temp_mat,
+    wind = wind_mat,
+    rain = rain_mat)
+  
+  # Create unmarked frame
+  umf <- unmarkedFrameOccu(
+    y = y,
+    siteCovs = site_covs_scaled,
+    obsCovs = list(
+      temp = temp_mat,
+      wind = wind_mat,
+      rain = rain_mat))
+  
+  # Fit occupancy model
+  model <- occu(
+    ~ temp + wind + rain ~ log_patch_size + elevation_m + distance_to_nearest_patch_m + forest_cover_percent_in_1km_buffer_exc_target_patch,
+    data = umf)
+  
+  results[[sp]] <- model}
+
+# MacKenzie and Bailey goodness-of-fit for single-season occupancy model
+mb.gof.test(results[[1]], nsim = 1000)
+# p = 0.242, greater than 0.05 meaning no significant lack of fit
+# c-hat = 1.55, mild overdispersion
+
+gof_results <- list()
+
+for(sp in names(results)) {
+  
+  cat("Running GOF for:", sp, "\n")
+  
+  gof_results[[sp]] <- tryCatch({
+    mb.gof.test(results[[sp]], nsim = 1000)
+  }, error = function(e) {
+    return(NA)
+  })
+}
+
+gof_summary <- data.frame(
+  species = names(results),
+  p_value = NA,
+  chat = NA
+)
+
+for(i in seq_along(results)) {
+  
+  gof <- tryCatch(
+    mb.gof.test(results[[i]], nsim = 1000),
+    error = function(e) return(NULL)
+  )
+  
+  if(!is.null(gof)) {
+    
+    # try multiple possible locations safely
+    pval <- if(!is.null(gof$p.value)) gof$p.value else NA
+    
+    chat <- NA
+    if(!is.null(gof$chisq) && !is.null(gof$df)) {
+      chat <- gof$chisq / gof$df
+    }
+    
+    gof_summary$p_value[i] <- pval
+    gof_summary$chat[i] <- chat
+  }
+}
+
+gof_summary$chat <- NA
+
+for(i in seq_along(results)) {
+  
+  gof <- mb.gof.test(results[[i]], nsim = 1000)
+  
+  gof_summary$chat[i] <- gof$c.hat.est
+}
+
+gof_summary
+
+# species p_value        chat
+# 1         Acanthis flammea   0.224   1.6841648
+# 2      Aegithalos caudatus   0.517   0.8794941
+# 3         Alauda arvensis   0.023   3.5551595
+# 4                Apus apus   0.422   0.8389353
+# 5              Buteo buteo   0.045   2.6094699
+# 6      Carduelis carduelis   0.308   1.0648040
+# 7       Certhia familiaris   0.310   0.9456115
+# 8          Chloris chloris   0.197   1.0190967
+# 9           Circus cyaneus   0.000   1.1203138
+# 10           Columba oenas   0.028  11.4621803
+# 11        Columba palumbus   0.189   1.4041067
+# 12            Corvus corax   0.041   2.6340142
+# 13           Corvus cornix   0.810   0.5592073
+# 14           Corvus corone   0.281   1.2505602
+# 15       Corvus frugilegus   0.402   1.0070114
+# 16         Corvus monedula   0.639   0.6455367
+# 17        Curruca communis   0.001   2.8790726
+# 18     Cyanistes caeruleus   0.251   1.2601106
+# 19        Delichon urbicum   0.000  94.7165834
+# 20       Dendrocopos major   0.533   0.8828383
+# 21     Emberiza citrinella   0.235   1.2818613
+# 22      Erithacus rubecula   0.111   2.0093583
+# 23       Falco tinnunculus   0.136   5.5068464
+# 24      Ficedula hypoleuca   0.000   3.3984086
+# 25       Fringilla coelebs   0.666   0.6681083
+# 26     Garrulus glandarius   0.404   1.0088478
+# 27         Hirundo rustica   0.546   0.5580484
+# 28       Linaria cannabina   0.000   3.3430342
+# 29       Locustella naevia   0.000   3.3430342
+# 30   Lophophanes cristatus   0.000   3.3984086
+# 31       Loxia curvirostra   0.085   5.3551034
+# 32          Motacilla alba   0.000   1.0000000
+# 33       Motacilla cinerea   0.030   7.1364822
+# 34       Muscicapa striata   0.021   2.4536923
+# 35             Parus major   0.607   0.7185841
+# 36         Passer montanus   0.205   0.5839571
+# 37          Periparus ater   0.303   1.1845354
+# 38     Phasianus colchicus   0.239   1.4193287
+# 39    Phoenicurus ochruros   1.000   0.9999999
+# 40 Phoenicurus phoenicurus   0.173   2.4111644
+# 41  Phylloscopus collybita   0.050   2.1146975
+# 42 Phylloscopus sibilatrix   0.163   1.5310102
+# 43  Phylloscopus trochilus   0.515   0.7908564
+# 44               Pica pica   0.317   1.0772545
+# 45           Picus viridis   0.000   7.1753510
+# 46      Prunella modularis   0.329   1.1238794
+# 47       Pyrrhula pyrrhula   0.564   0.7962551
+# 48         Regulus regulus   0.465   0.9640188
+# 49      Scolopax rusticola   0.002   4.8839468
+# 50          Sitta europaea   0.276   1.2029860
+# 51           Spinus spinus   0.200   1.3488291
+# 52   Streptopelia decaocto   0.008   9.9284492
+# 53             Strix aluco   0.395   0.9768863
+# 54      Sylvia atricapilla   0.500   0.8982041
+# 55 Troglodytes troglodytes   0.000 712.6612009
+# 56          Turdus iliacus   0.201   1.3733718
+# 57           Turdus merula   0.052   2.2040131
+# 58       Turdus philomelos   0.897   0.3604733
+# 59       Turdus viscivorus   0.746   0.4190217
+# 60               Tyto alba   0.337   1.0313722
+
+gof_summary$flag <- "good"
+gof_summary$flag[gof_summary$chat > 2] <- "moderate"
+gof_summary$flag[gof_summary$chat > 4] <- "high"
+gof_summary$flag[gof_summary$chat > 10] <- "extreme"
+
+table(gof_summary$flag)
+
+vif(lm(log_patch_size ~ elevation_m +
+         distance_to_nearest_patch_m +
+         forest_cover_percent_in_1km_buffer_exc_target_patch,
+       data = site_covs))
+
+
+### 6. SPECIES RICHNESS ANALYSIS ----
+
+psi <- sapply(results, function(m){
+  predict(m, type = "state")$Predicted})
+
+richness <- rowSums(psi, na.rm = TRUE)
+
+lm_richness <- lm(richness ~ site_covs$log_patch_size)
+summary(lm_richness)
+
+plot_data <- data.frame(
+  site = site_covs$site,
+  log_patch_size = site_covs$log_patch_size,
+  richness = richness)
+
+ggplot(plot_data,
+                         aes(x = log_patch_size, y = richness)) +
+    geom_point(size = 2.25, colour = "black") +
+    geom_smooth(method = "lm", colour = "#D7191C", se = TRUE, alpha = 0.25) +
+    theme_test() +
+    theme(axis.title = element_text(face = "bold", size = 12)) +
+    labs(
+      x = "log(Forest Patch Size (m²))",
+      y = "Estimated Bird Species Richness")
+
+# Model diagnostics
+AIC(results[[1]])
+lapply(results, AIC)
+
+
+### 7. ASSEMBLAGE ANAYLSIS ----
+
+site_covs$patch_size_cat <- cut(
+  site_covs$log_patch_size,
+  breaks = 3,
+  labels = c("Small","Medium","Large"))
+
+# Convert predicted occupancy to presence/absence (threshold 0.5)
+psi_bin <- ifelse(psi >= 0.5, 1, 0)
+
+# Run NMDS using Jaccard
+nmds <- metaMDS(psi_bin, distance = "jaccard", k = 2, trymax = 100)
+
+nmds$stress
+
+# Extract site scores (coordinates)
+site_scores <- as.data.frame(scores(nmds, display = "sites"))
+site_scores$site <- 1:nrow(site_scores)
+site_scores$patch_size_cat <- site_covs$patch_size_cat
+
+colnames(site_scores)
+
+ggplot(site_scores, aes(x = NMDS1, y = NMDS2, color = patch_size_cat)) +
+    geom_point(size = 3) +
+    theme_minimal() +
+    labs(color = "Patch size") +
+    ggtitle("NMDS of Bird Assemblages by Patch Size")
+
+
+adonis2(psi_bin ~ site_covs$log_patch_size, method = "jaccard")
+
+disp <- betadisper(vegdist(psi_bin, method="jaccard"),
+                   site_covs$patch_size_cat)
+
+anova(disp)
+# p = 0.2813
+
+# Define custom colors
+patch_colors <- c("Small" = "#A6E22E", 
+                  "Medium" = "#9C179E",  
+                  "Large" = "#1565C0") 
+
+ggplot(site_scores, aes(x = NMDS1, y = NMDS2, color = patch_size_cat, fill = patch_size_cat)) +
+  geom_point(size = 3) +
+  
+  # Transparent filled ellipses
+  stat_ellipse(aes(group = patch_size_cat),
+               geom = "polygon",
+               alpha = 0.2,
+               color = NA) +
+  
+  scale_color_manual(values = patch_colors) +
+  scale_fill_manual(values = patch_colors) +
+  
+  theme_test() +
+  theme(axis.title = element_text(face = "bold", size = 12),
+        legend.title = element_text(face = "bold", size = 12),
+        legend.text = element_text(size = 10)) +
+  labs(
+    color = "Patch size",
+    fill = "Patch size")
+
+
+### 8. SPECIALISTS VS GENERALISTS ----
+
+# Read the SSI CSV
+ssi <- read_csv("your_path")
+
+# Inspect the data
+head(ssi)
+str(ssi)
+
+# Assign specialist/generalist based on SSI
+# Here, you can define a cutoff; for example, SSI > 1 = specialist, <=1 = generalist
+ssi <- ssi %>%
+  mutate(
+    guild = ifelse(SSI > 1, "specialist", "generalist"))
+
+# Check the classification
+table(ssi$guild)
+
+# Convert psi matrix to a long-format data frame
+psi_df <- as.data.frame(psi)
+psi_df$site <- 1:nrow(psi_df)  # add site identifier
+
+psi_long <- psi_df %>%
+  pivot_longer(
+    cols = -site,
+    names_to = "Scientific_Name",
+    values_to = "psi")
+
+# Rename for convenience
+ssi <- ssi %>%
+  rename(Scientific_Name = `Scientific Name`)  # backticks needed for spaces
+
+# If 'guild' column doesn't already exist, create it from SSI
+ssi <- ssi %>%
+  mutate(guild = ifelse(SSI > median(SSI, na.rm = TRUE), "specialist", "generalist"))
+
+# Merge with psi_long
+psi_long <- psi_long %>%
+  left_join(ssi %>% select(Scientific_Name, guild), by = "Scientific_Name")
+
+# Species in psi_long not in ssi
+setdiff(unique(psi_long$Scientific_Name), ssi$Scientific_Name)
+
+# Create a named vector to map mismatched species names to the SSI names
+name_corrections <- c(
+  "Periparus ater"        = "Parus ater",
+  "Delichon urbicum"      = "Delichon urbica",
+  "Acanthis flammea"      = "Carduelis flammea",
+  "Lophophanes cristatus" = "Parus cristatus",
+  "Cyanistes caeruleus"   = "Parus caeruleus",
+  "Linaria cannabina"     = "Carduelis cannabina",
+  "Spinus spinus"         = "Carduelis spinus",
+  "Chloris chloris"       = "Carduelis chloris",
+  "Curruca communis"      = "Sylvia communis")
+
+# Apply the corrections
+psi_long <- psi_long %>%
+  mutate(Scientific_Name = ifelse(Scientific_Name %in% names(name_corrections),
+                                  name_corrections[Scientific_Name],
+                                  Scientific_Name))
+
+psi_long <- psi_long %>%
+  left_join(ssi %>% select(Scientific_Name, guild),
+            by = "Scientific_Name")
+
+# Keep the guild from ssi and remove the old one
+psi_long <- psi_long %>%
+  select(site, Scientific_Name, psi, guild = guild.y)
+
+# Check
+head(psi_long)
+
+# Check for any remaining NAs
+sum(is.na(psi_long$guild))
+
+# See which species are missing
+psi_long %>%
+  filter(is.na(guild)) %>%
+  distinct(Scientific_Name)
+
+psi_long <- psi_long %>%
+  mutate(guild = ifelse(Scientific_Name == "Carduelis flammea", 
+                        "specialist", guild))
+
+# Check that there are no more NAs
+sum(is.na(psi_long$guild))
+
+psi_long <- psi_long %>%
+  left_join(site_covs %>% select(site, log_patch_size), by = "site")
+
+
+# Make guild a factor
+psi_long <- psi_long %>%
+  mutate(guild = factor(guild, levels = c("generalist", "specialist")))
+
+# Transform to avoid exact 0 or 1
+psi_long <- psi_long %>%
+  mutate(psi_beta = (psi * (nrow(.) - 1) + 0.5) / nrow(.))
+
+# Fit beta regression
+beta_model <- betareg(psi_beta ~ log_patch_size * guild,
+                      data = psi_long)
+beta_model2 <- glmmTMB(psi_beta ~ log_patch_size * guild, data = psi_long, 
+                       family = list(family = "beta", link = "logit"))
+summary(beta_model)
+
+# Diagnostic plots
+plot(beta_model) 
+simulateResiduals(beta_model2, plot=T)
+
+# Null model
+null_model <- betareg(psi_beta ~ 1, data = psi_long)
+
+# Likelihood ratio test
+lrtest <- lmtest::lrtest(beta_model, null_model)
+lrtest
+
+res <- residuals(beta_model, type="pearson")
+phi_est <- mean(res^2)
+phi_est  # If >> 1, overdispersion may be present
+
+# Create a new dataset for predictions
+newdata <- expand.grid(
+  log_patch_size = seq(min(psi_long$log_patch_size), max(psi_long$log_patch_size), length.out = 100),
+  guild = c("generalist", "specialist"))
+
+# Predicted occupancy
+newdata$psi_pred <- predict(beta_model, newdata = newdata, type = "response")
+
+# Plot
+ggplot(newdata, aes(x = log_patch_size, y = psi_pred, color = guild)) +
+    geom_line(size = 1.2) +
+    theme_minimal() +
+    labs(x = "Log Patch Size", y = "Predicted Occupancy (Psi)",
+         color = "Guild") +
+    ggtitle("Predicted Occupancy of Specialists vs Generalists by Patch Size")
+
+patch_grid <- seq(min(psi_long$log_patch_size), max(psi_long$log_patch_size), length.out = 1000)
+newdata <- data.frame(
+  log_patch_size = rep(patch_grid, 2),
+  guild = rep(c("generalist", "specialist"), each = length(patch_grid)))
+
+newdata$psi_pred <- predict(beta_model, newdata = newdata, type = "response")
+
+pred_wide <- newdata %>%
+  tidyr::pivot_wider(names_from = guild, values_from = psi_pred)
+
+# Calculate difference
+pred_wide <- pred_wide %>%
+  mutate(diff_psi = specialist - generalist)
+
+# Find where the difference changes sign (crossing)
+cross_index <- which(pred_wide$diff_psi[-1] * pred_wide$diff_psi[-nrow(pred_wide)] < 0)
+cross_patch_size <- patch_grid[cross_index]
+cross_patch_size
+
+# Convert from log scale to raw patch size
+exp(cross_patch_size)
+
+
+# Create a sequence of log patch sizes for prediction
+log_patch_seq <- seq(min(psi_long$log_patch_size),
+                     max(psi_long$log_patch_size), length.out = 100)
+
+# Predict for each guild
+pred_df <- expand.grid(log_patch_size = log_patch_seq,
+                       guild = c("generalist", "specialist"))
+
+# Use the fitted beta regression model to predict
+pred_df$psi_pred <- predict(beta_model, newdata = pred_df, type = "response")
+
+# Add crossover point (log and raw scale)
+cross_patch_log <- cross_patch_size      # from your calculation
+cross_patch_raw <- exp(cross_patch_log)
+
+
+coef_est <- coef(beta_model)
+vcov_mat <- vcov(beta_model)
+
+n_sim <- 1000
+
+coef_sim <- mvrnorm(n_sim, coef_est, vcov_mat)
+
+find_cross <- function(coefs){
+  
+  patch_grid <- seq(min(psi_long$log_patch_size),
+                    max(psi_long$log_patch_size),
+                    length.out = 1000)
+  
+  # predicted values for generalists
+  gen <- coefs["(Intercept)"] +
+    coefs["log_patch_size"] * patch_grid
+  
+  # predicted values for specialists
+  spec <- coefs["(Intercept)"] +
+    coefs["guildspecialist"] +
+    (coefs["log_patch_size"] +
+       coefs["log_patch_size:guildspecialist"]) * patch_grid
+  
+  gen <- plogis(gen)
+  spec <- plogis(spec)
+  
+  diff <- spec - gen
+  
+  cross <- which(diff[-1] * diff[-length(diff)] < 0)
+  
+  if(length(cross) == 0) return(NA)
+  
+  patch_grid[cross[1]]}
+
+cross_sim <- apply(coef_sim, 1, find_cross)
+cross_sim <- cross_sim[!is.na(cross_sim)]
+
+cross_raw <- exp(cross_sim)
+
+median(cross_raw)
+
+quantile(cross_raw, c(0.025, 0.975))
+
+hist(cross_raw,
+      breaks = 30,
+      col = "lightblue",
+      main = "Uncertainty in specialist dominance threshold",
+      xlab = "Patch size (m²)")
+
+
+coefs <- coef(beta_model)
+
+log_cross <- -coefs["guildspecialist"] /
+  coefs["log_patch_size:guildspecialist"]
+
+patch_cross <- exp(log_cross)
+
+cross_fun <- function(b){
+  -b["guildspecialist"] / b["log_patch_size:guildspecialist"]}
+
+ci_log <- deltamethod(
+  ~ -x2/x4,
+  coef(beta_model)[c("(Intercept)",
+                     "log_patch_size",
+                     "guildspecialist",
+                     "log_patch_size:guildspecialist")],
+  vcov(beta_model)[c("(Intercept)",
+                     "log_patch_size",
+                     "guildspecialist",
+                     "log_patch_size:guildspecialist"),
+                   c("(Intercept)",
+                     "log_patch_size",
+                     "guildspecialist",
+                     "log_patch_size:guildspecialist")])
+
+exp(log_cross + c(-1.96, 1.96) * ci_log)
+
+cross_patch_raw <- 34225
+
+# Plot
+ggplot(pred_df, aes(x = exp(log_patch_size), y = psi_pred, color = guild)) +
+  
+  # Uncertainty band
+  annotate("rect",
+           xmin = 16104,
+           xmax = 58542,
+           ymin = -Inf,
+           ymax = Inf,
+           alpha = 0.15,
+           fill = "grey50") +
+  
+  geom_line(size = 1.25) +
+  
+  # Crossover line
+  geom_vline(xintercept = cross_patch_raw,
+             linetype = "dashed",
+             color = "black",
+             size = 1.25) +
+  
+  scale_x_continuous(
+    breaks = c(100000, 200000, 300000, 400000, cross_patch_raw),
+    labels = c(
+      "100,000",
+      "200,000",
+      "300,000",
+      "400,000",
+      "<b>Crossover<br>34,225 m²</b>")) +
+  
+  scale_color_manual(values = c(
+    "generalist" = "#2C7BB6",
+    "specialist" = "#D7191C")) +
+  
+  theme_test() +
+  
+  theme(axis.text.x = element_markdown(size = 10),
+        axis.text.y = element_text(size = 10),
+        axis.title = element_text(face = "bold", size = 12),
+        legend.title = element_text(face = "bold", size = 12), 
+        legend.text = element_text(size = 11)) +
+  
+  labs(
+    x = "Patch size (m²)",
+    y = "Predicted Occupancy (ψ)",
+    color = "Guild")
+
+# Number of prediction points
+n_points <- nrow(pred_df)
+
+# Storage matrix
+pred_sim <- matrix(NA, nrow = n_points, ncol = n_sim)
+
+for(i in 1:n_sim){
+  
+  b <- coef_sim[i, ]
+  
+  # linear predictor
+  eta <- b["(Intercept)"] +
+    b["log_patch_size"] * pred_df$log_patch_size +
+    b["guildspecialist"] * (pred_df$guild == "specialist") +
+    b["log_patch_size:guildspecialist"] * pred_df$log_patch_size * (pred_df$guild == "specialist")
+  
+  pred_sim[, i] <- plogis(eta)}
+
+pred_df$lower <- apply(pred_sim, 1, quantile, 0.025)
+pred_df$upper <- apply(pred_sim, 1, quantile, 0.975)
+
+# (recompute mean prediction for consistency)
+pred_df$psi_pred <- rowMeans(pred_sim)
+
+
+theme(axis.text.x = element_markdown())
+
+ggplot(pred_df,
+       aes(x = exp(log_patch_size),
+           y = psi_pred,
+           color = guild,
+           fill = guild)) +
+  
+  # Simulation-based ribbons
+  geom_ribbon(aes(ymin = lower, ymax = upper),
+              alpha = 0.15,
+              color = NA) +
+  
+  # Your crossover uncertainty band
+  annotate("rect",
+           xmin = 16104,
+           xmax = 58542,
+           ymin = -Inf,
+           ymax = Inf,
+           alpha = 0.15,
+           fill = "grey50") +
+  
+  geom_line(size = 1.2) +
+  
+  geom_vline(xintercept = cross_patch_raw,
+             linetype = "dashed",
+             color = "black",
+             size = 1.2) +
+  
+  scale_color_manual(
+    values = c(
+      "generalist" = "#2C7BB6",
+      "specialist" = "#D7191C"),
+    labels = c(
+      "generalist" = "Generalist",
+      "specialist" = "Specialist")) +
+  
+  scale_fill_manual(
+    values = c(
+      "generalist" = "#2C7BB6",
+      "specialist" = "#D7191C"),
+    labels = c(
+      "generalist" = "Generalist",
+      "specialist" = "Specialist")) +
+ 
+  scale_x_continuous(
+    breaks = c(100000, 200000, 300000, 400000, cross_patch_raw),
+    labels = c(
+      "100,000",
+      "200,000",
+      "300,000",
+      "400,000",
+      "<b>Crossover<br>34,225</b>")) +
+ 
+  guides(fill = "none") +
+  
+  theme_test() +
+  theme(axis.text.x = element_markdown(),
+        axis.title = element_text(face = "bold", size = 12),
+        legend.title = element_text(face = "bold", size = 12),
+        legend.text = element_text(size = 11),
+        axis.text = element_text(size = 10)) +
+  
+  labs(x = "Patch size (m²)",
+       y = "Predicted occupancy (ψ)",
+       color = "Guild" )
+
+
+### 9. INDICATOR SPECIES ANALYSIS----
+
+patch_group <- cut(site_covs$log_patch_size, 3,
+                   labels = c("Small","Medium","Large"))
+
+# Community matrix (sites x species)
+comm_matrix <- psi
+
+# Optional but recommended: convert to presence/absence
+comm_matrix <- ifelse(comm_matrix >= 0.5, 1, 0)
+
+# Ensure it's a matrix
+comm_matrix <- as.matrix(comm_matrix)
+
+indval <- multipatt(
+  comm_matrix,
+  patch_group,
+  func = "IndVal.g",
+  control = how(nperm = 999))
+
+summary(indval)
+
+ind_table <- data.frame(indval$sign)
+
+(ind_table <- ind_table %>%
+    filter(p.value < 0.05))
+
+
+plot_ind <- ind_table %>%
+  mutate(species = rownames(ind_table)) %>%
+  select(species, s.Small, s.Medium, s.Large, stat) %>%
+  pivot_longer(cols = starts_with("s."),
+               names_to = "patch_group",
+               values_to = "association") %>%
+  mutate(patch_group = gsub("s.", "", patch_group))
+
+
+ind_plot <- ind_table %>%
+  mutate(
+    species = rownames(ind_table),
+    group = case_when(
+      s.Small == 1 & s.Medium == 0 & s.Large == 0 ~ "Small",
+      s.Small == 0 & s.Medium == 1 & s.Large == 0 ~ "Medium",
+      s.Small == 0 & s.Medium == 0 & s.Large == 1 ~ "Large",
+      s.Small == 1 & s.Medium == 1 ~ "Small + Medium",
+      s.Medium == 1 & s.Large == 1 ~ "Medium + Large"))
+
+ind_plot <- ind_plot %>%
+  mutate(group = factor(group,
+         levels = c("Large",
+         "Medium + Large",
+         "Medium",
+         "Small + Medium",
+         "Small")))
+
+ind_plot <- ind_plot %>%
+  arrange(group, desc(stat))
+
+ind_plot$species <- factor(ind_plot$species,
+                           levels = rev(ind_plot$species))
+
+indicator_colors <- c(
+  "Small" = "#A6E22E",
+  "Medium" = "#9C179E",
+  "Large" = "#1565C0",
+  "Small + Medium" = "#4CAF50",
+  "Medium + Large" = "#90CAF9",
+  "Not indicator" = "grey50")
+
+ggplot(ind_plot,
+       aes(x = stat,
+           y = species,
+           fill = group)) +
+  
+  geom_col(width = 0.7) +
+  
+  scale_fill_manual(values = indicator_colors) +
+  
+  labs(x = "Indicator value (IndVal)",
+       y = "Species",
+       fill = "Patch size group") +
+  
+  theme_test() +
+  
+  theme(axis.text = element_text(size = 10),
+        axis.title = element_text(face = "bold", size = 12),
+        axis.text.y = element_text(face = "italic", size = 10),
+        legend.title = element_text(face = "bold"))
+
+
+# Bonferroni-corrected p-values
+ind_table <- data.frame(indval$sign)
+head(ind_table)
+
+# Apply Bonferroni correction
+ind_table$p.bonf <- p.adjust(ind_table$p.value, method = "bonferroni")
+
+ind_table_bonf <- ind_table %>% 
+  filter(p.bonf < 0.05)
+
+# View results
+ind_table_bonf
+
+
+### 10. SENSITIVITY ANALYSIS ----
+
+sens_results <- lapply(names(results), function(sp){
+  
+  mod <- results[[sp]]
+  
+  # Try to extract safely
+  out <- tryCatch({
+    
+    cf <- summary(mod)$state
+    
+    data.frame(
+      species = sp,
+      beta_patch = cf["log_patch_size","Estimate"],
+      se = cf["log_patch_size","SE"])}, error = function(e){
+    
+    data.frame(
+      species = sp,
+      beta_patch = NA,
+      se = NA)})
+  
+  return(out)})
+
+sens_df <- do.call(rbind, sens_results)
+
+sum(is.na(sens_df$beta_patch))
+# 6
+
+sens_df_clean <- sens_df %>%
+  filter(!is.na(beta_patch),
+         !is.na(se)) %>%
+  mutate(z = beta_patch / se) %>%
+  filter(is.finite(z),
+         abs(z) < 10)
+
+nrow(sens_df_clean)
+# 52
+
+# EXCLUDED SPECIES DIAGNOSTIC
+
+# Total species with models
+total_modelled <- length(results)
+
+# Species in final clean dataset
+kept_species <- sens_df_clean$species
+
+# All species that had models attempted
+all_species <- names(results)
+
+# The 8 excluded
+excluded_species <- setdiff(all_species, kept_species)
+
+cat("Total modelled:", total_modelled, "\n")
+cat("Retained for analysis:", length(kept_species), "\n")
+cat("Excluded:", length(excluded_species), "\n\n")
+
+cat("Excluded species:\n")
+print(excluded_species)
+
+# Get detection counts for these 8
+excluded_detection_summary <- det_long %>%
+  filter(scientific_name %in% excluded_species) %>%
+  group_by(scientific_name) %>%
+  summarise(
+    n_sites = sum(detected > 0),
+    total_detections = sum(detected),
+    .groups = "drop"
+  )
+
+cat("\nDetection summary for excluded species:\n")
+print(excluded_detection_summary)
+
+# Save for your records
+write.csv(excluded_detection_summary, "excluded_8_species.csv", row.names = FALSE)
+
+
+sens_df_clean <- sens_df_clean %>%
+  mutate(
+    sensitivity_cat = case_when(
+      beta_patch <= quantile(beta_patch, 0.25) ~ "High",
+      beta_patch <= quantile(beta_patch, 0.75) ~ "Moderate",
+      TRUE ~ "Low"))
+
+ggplot(sens_df_clean, aes(x = reorder(species, beta_patch), y = beta_patch)) +
+  geom_col() +
+  coord_flip()
+
+sens_df_clean <- sens_df_clean %>%
+  left_join(
+    psi_long %>% dplyr::select(Scientific_Name, guild) %>% distinct(),
+    by = c("species" = "Scientific_Name"))
+
+table(sens_df_clean$guild)
+
+sens_df_clean %>%
+  filter(guild == "specialist")
+
+
+# Plot
+sens_df_clean %>%
+  arrange(beta_patch) %>%
+  mutate(species = factor(species, levels = species)) %>%
+  
+  ggplot(aes(x = beta_patch, y = species)) +
+  
+  geom_col(fill = "#2D708E", width = 0.7) +
+  
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  
+  labs(x = "Effect of patch size on occupancy (β)",
+       y = "Species") +
+  
+  theme_classic() +
+  
+  theme(axis.text = element_text(size = 9),
+        axis.title = element_text(face = "bold"))
+
+
+sens_df_clean <- sens_df_clean %>%
+  mutate(large_patch_species = beta_patch > quantile(beta_patch, 0.75))
+
+# Overlap indicator species 
+
+ind_table$species <- rownames(indval$sign)[rownames(indval$sign) %in% rownames(ind_table)]
+
+indicator_species <- ind_table %>%
+  mutate(group = case_when(
+         s.Large == 1 & s.Medium == 0 ~ "Large",
+         s.Large == 1 & s.Medium == 1 ~ "Medium + Large",
+         TRUE ~ NA_character_)) %>%
+  filter(!is.na(group)) %>%
+  pull(species)
+
+
+sens_df_clean <- sens_df_clean %>%
+  mutate(indicator = species %in% indicator_species)
+
+
+table(sens_df_clean$indicator)
+
+
+ind_groups <- ind_table %>%
+  mutate(
+    species = rownames(ind_table),
+    ind_group = case_when(
+      s.Small == 1 & s.Medium == 0 & s.Large == 0 ~ "Small",
+      s.Small == 0 & s.Medium == 1 & s.Large == 0 ~ "Medium",
+      s.Small == 0 & s.Medium == 0 & s.Large == 1 ~ "Large",
+      s.Small == 1 & s.Medium == 1 ~ "Small + Medium",
+      s.Medium == 1 & s.Large == 1 ~ "Medium + Large",
+      TRUE ~ NA_character_)) %>%
+  select(species, ind_group)
+
+sens_df_clean <- sens_df_clean %>%
+  left_join(ind_groups, by = "species")
+
+# Ensure ordering is fixed
+sens_df_clean <- sens_df_clean %>%
+  arrange(beta_patch) %>%
+  mutate(species = factor(species, levels = species))
+
+
+sens_df_clean <- sens_df_clean %>%
+  mutate(ind_group = ifelse(is.na(ind_group), "Not indicator", ind_group))
+
+sens_df_clean <- sens_df_clean %>%
+  mutate(ind_group = factor(ind_group,
+                            levels = c(
+                              "Large",
+                              "Medium + Large",
+                              "Medium",
+                              "Small + Medium",
+                              "Small",
+                              "Not indicator")))
+
+
+ggplot(sens_df_clean %>% arrange(beta_patch),
+       aes(x = beta_patch,
+           y = reorder(species, beta_patch))) +
+  
+  # Lollipop stems
+  geom_segment(aes(x = 0, xend = beta_patch, yend = species),
+               color = "grey60",
+               linewidth = 0.75) +
+  
+  # Points coloured by indicator group
+  geom_point(aes(color = ind_group),
+             size = 3) +
+  
+  # Species with NO indicator status → grey
+  scale_color_manual(
+    values = indicator_colors,
+    na.value = "grey70") +
+  
+  # Zero line
+  geom_vline(xintercept = 0,
+             color = "black",
+             linetype = "solid",
+             linewidth =0.75) +
+  
+  labs(
+    x = "Effect of Patch Size on Occupancy (β)",
+    y = "Species",
+    color = "Indicator group") +
+  
+  theme_test() +
+  theme(
+    axis.text.y = element_text(size = 8, face = "italic"),
+    axis.title = element_text(face = "bold"),
+    legend.title = element_text(face = "bold"),
+    panel.grid.major.y = element_line(color = "grey95"))
+
