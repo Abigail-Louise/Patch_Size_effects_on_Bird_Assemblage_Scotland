@@ -1,0 +1,10 @@
+This folder contains all data used in analysis, including patch size and bird detection excel spreadsheets, SSI values and ERA5 weather dataset.
+
+
+### SSI values are from the supplementary material within:
+
+Sullivan, M.J.P., Newson, S.E. and Pearce-Higgins, J.W. (2016). Changing densities of generalist species underlie apparent homogenization of UK bird communities. Ibis, 158(3), pp.645–655. doi:https://doi.org/10.1111/ibi.12370.
+
+### Weather data from:
+
+ECMWF (2026). ERA5 hourly data on single levels from 1940 to present. Copernicus.eu. [online] doi:https://doi.org/10.24381/cds.adbb2d47.
